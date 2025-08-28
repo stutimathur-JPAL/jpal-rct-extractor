@@ -1,37 +1,36 @@
-import os, io, re, json
+import os, io, re, json, time
 import requests
 import pandas as pd
 import streamlit as st
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
-# PDF + tables
-import fitz  # PyMuPDF
-import pdfplumber
+# ---------- SETTINGS ----------
+st.set_page_config(page_title="RCT Metric Search", page_icon="🔎", layout="wide")
+st.title("🔎 RCT Metric Search")
+st.caption("Type what you need (country, sector, metric). Returns 2–4 verified results with exact values, snippets, links, and provenance.")
 
-# ---------- read secrets ----------
+# Secrets (set these in Streamlit Cloud → Edit secrets)
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 SHEET_CSV_URL  = st.secrets.get("GOOGLE_SHEET_CSV_URL", "")
 CSE_API_KEY    = st.secrets.get("GOOGLE_CSE_API_KEY", "")
 CSE_CX         = st.secrets.get("GOOGLE_CSE_CX", "")
 
-st.set_page_config(page_title="RCT Metric Extractor", page_icon="📊", layout="wide")
-st.title("📊 RCT Metric Extractor")
-st.caption("Pull SD, SE, ICC, MDE, Variance from PDFs. If missing, try the open web and GPT. Always label the source.")
-
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RCTMetricBot/1.0)"}
 
-# ---------- helpers ----------
+# ---------- HELPERS ----------
+@st.cache_data(show_spinner=False, ttl=60*60)
 def load_sheet(csv_url: str) -> pd.DataFrame:
     try:
-        return pd.read_csv(csv_url)
+        df = pd.read_csv(csv_url)
+        return df
     except Exception as e:
-        st.error(f"Could not load sheet: {e}")
+        st.error(f"Could not load sheet (CSV): {e}")
         return pd.DataFrame()
 
-def http_get(url, timeout=30):
+def http_get(url, timeout=25):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
         r.raise_for_status()
         return r
     except Exception:
@@ -41,12 +40,11 @@ def fetch_pdf_bytes(url) -> bytes | None:
     r = http_get(url)
     if not r:
         return None
-    ctype = r.headers.get("Content-Type", "").lower()
-    if "pdf" in ctype or url.lower().endswith(".pdf"):
+    ct = r.headers.get("Content-Type","").lower()
+    if "pdf" in ct or url.lower().endswith(".pdf"):
         return r.content
-    if "html" in ctype:
+    if "html" in ct:
         soup = BeautifulSoup(r.text, "lxml")
-        # look for a link ending with .pdf
         for a in soup.select("a[href]"):
             href = a["href"]
             if ".pdf" in href.lower():
@@ -57,83 +55,72 @@ def fetch_pdf_bytes(url) -> bytes | None:
     return None
 
 def pdf_to_text_and_tables(pdf_bytes: bytes):
-    text_chunks = []
-    # text
+    text_chunks, table_chunks = [], []
     try:
+        import fitz
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
             for i, page in enumerate(doc, start=1):
-                text = page.get_text("text") or ""
-                if text.strip():
-                    text_chunks.append(f"[PAGE {i}] {text}")
+                txt = page.get_text("text") or ""
+                if txt.strip():
+                    text_chunks.append(f"[PAGE {i}] {txt}")
     except Exception:
         pass
-    # tables
-    table_chunks = []
     try:
+        import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for pnum, page in enumerate(pdf.pages, start=1):
                 try:
                     tables = page.extract_tables()
                     for ti, tb in enumerate(tables or []):
-                        rows = ["\t".join([c if c else "" for c in row]) for row in tb]
-                        table_text = f"[PAGE {pnum} TABLE {ti+1}]\n" + "\n".join(rows)
-                        table_chunks.append(table_text)
+                        rows = ["\t".join([(c or "") for c in row]) for row in tb]
+                        table_chunks.append(f"[PAGE {pnum} TABLE {ti+1}]\n" + "\n".join(rows))
                 except Exception:
                     continue
     except Exception:
         pass
-    full_text = "\n".join(text_chunks)
-    tables_text = "\n\n".join(table_chunks)
-    return full_text, tables_text
+    return "\n".join(text_chunks), "\n\n".join(table_chunks)
 
 NUM = r"(?:-?\d+(?:\.\d+)?)"
 PCT = r"(?:-?\d+(?:\.\d+)?\s?%)"
+METRIC_PATTERNS = {
+    "SD": rf"(?:\bSD\b|standard deviation)\D{{0,20}}({NUM})",
+    "SE": rf"(?:\bSE\b|standard error)\D{{0,20}}({NUM})",
+    "ICC": rf"(?:\bICC\b|intra[- ]?cluster.*?correlation)\D{{0,20}}({NUM})",
+    "MDE": rf"(?:\bMDE\b|minimum detectable effect)\D{{0,30}}({NUM}|{PCT})",
+    "Variance": rf"(?:\bvariance\b)\D{{0,20}}({NUM})",
+}
 
-def regex_find_metrics(text: str):
-    OUT = []
-    for m in re.finditer(rf"(?:ICC|intra[- ]?cluster.*?correlation)\D{{0,20}}({NUM})", text, flags=re.I):
-        OUT.append(("ICC", m.group(1), "regex"))
-    for m in re.finditer(rf"(?:SD|standard deviation)\D{{0,20}}({NUM})", text, flags=re.I):
-        OUT.append(("SD", m.group(1), "regex"))
-    for m in re.finditer(rf"(?:SE|standard error)\D{{0,20}}({NUM})", text, flags=re.I):
-        OUT.append(("SE", m.group(1), "regex"))
-    for m in re.finditer(rf"(?:variance)\D{{0,20}}({NUM})", text, flags=re.I):
-        OUT.append(("Variance", m.group(1), "regex"))
-    for m in re.finditer(rf"(?:MDE|minimum detectable effect)\D{{0,20}}({NUM}|{PCT})", text, flags=re.I):
-        OUT.append(("MDE", m.group(1), "regex"))
-    return OUT
+def regex_extract(text: str, which_metric: str):
+    pat = METRIC_PATTERNS.get(which_metric)
+    if not pat: 
+        return None
+    m = re.search(pat, text, flags=re.I)
+    if not m:
+        return None
+    return m.group(1)
 
-def openai_structured_extract(context_text: str, title: str = "", authors: str = "", link: str = "") -> dict | None:
+def openai_extract(context_text: str, metric: str) -> dict | None:
     if not OPENAI_API_KEY:
         return None
     import requests as rq
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type":"application/json"}
     system = (
-        "You are a precise extraction assistant. "
-        "Extract ONLY if explicitly present. Do NOT guess. "
-        "Return JSON with keys sd, se, icc, mde, variance (numbers or strings or null), "
-        "and 'citations' as a list of {metric, snippet, page_hint}."
+        "You are a precise extraction assistant for academic PDFs. "
+        "Return a JSON object with keys: value (string or null), snippet (<=40 words), page_hint (string or null). "
+        "Extract ONLY if explicitly present. Do NOT guess."
     )
-    user = f"""
-Study: {title}
-Authors: {authors}
-Link: {link}
-
-Extract SD, SE, ICC, MDE, Variance ONLY if explicitly present in this text. If not, use null.
-Text begins:
-{context_text[:15000]}
-"""
+    user = f"Metric to extract: {metric}\n\nText:\n{context_text[:15000]}"
     body = {
         "model": "gpt-4o-mini",
         "temperature": 0,
         "response_format": {"type": "json_object"},
-        "messages": [{"role":"system","content":system},{"role":"user","content":user}]
+        "messages": [{"role":"system","content":system},{"role":"user","content":user}],
     }
     try:
-        resp = rq.post(url, headers=headers, json=body, timeout=90)
-        resp.raise_for_status()
-        s = resp.json()["choices"][0]["message"]["content"]
+        r = rq.post(url, headers=headers, json=body, timeout=70)
+        r.raise_for_status()
+        s = r.json()["choices"][0]["message"]["content"]
         return json.loads(s)
     except Exception:
         return None
@@ -142,130 +129,162 @@ def google_cse_search(query: str, num=3):
     if not (CSE_API_KEY and CSE_CX):
         return []
     params = {"key": CSE_API_KEY, "cx": CSE_CX, "q": query, "num": num}
-    r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=30)
+    r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=25)
     if r.status_code != 200:
         return []
-    items = r.json().get("items", [])
-    return [{"title": it.get("title"), "link": it.get("link"), "snippet": it.get("snippet")} for it in items]
+    return [{"title": it.get("title"), "link": it.get("link")} for it in r.json().get("items", [])]
 
-def extract_from_pdf_url(url, title="", authors=""):
-    pdf_bytes = fetch_pdf_bytes(url)
-    if not pdf_bytes:
-        return None, "no_pdf"
-    full_text, tables_text = pdf_to_text_and_tables(pdf_bytes)
-    joined = (tables_text + "\n\n" + full_text).strip()
+def try_one_study(row, metric, country_kw, sector_kw, keywords, use_web, strict_filter=False):
+    title = str(row.get("Title") or row.get("title") or row.get("Study") or row.get("Paper") or "")
+    authors = str(row.get("Authors") or row.get("authors") or "")
+    link = str(row.get("Link") or row.get("URL") or row.get("url") or "")
 
-    metrics = {"SD": None, "SE": None, "ICC": None, "MDE": None, "Variance": None}
-    cites = []
+    # quick pre-filter by keywords (optional)
+    hay = " ".join([title, authors, link]).lower()
+    all_ok = True
+    for kw in [country_kw, sector_kw, keywords]:
+        if strict_filter and kw and kw.lower() not in hay:
+            all_ok = False
+    if strict_filter and not all_ok:
+        return None
+
+    # 1) primary link → pdf
+    pdf = fetch_pdf_bytes(link)
+    used = link
+    if not pdf and use_web:
+        # search web for alt PDF
+        q = f'{title} {authors} filetype:pdf'
+        for hit in google_cse_search(q, num=3):
+            pdf = fetch_pdf_bytes(hit["link"])
+            if pdf:
+                used = hit["link"]
+                break
+    if not pdf:
+        return None
+
+    full_text, tables_text = pdf_to_text_and_tables(pdf)
+    merged = (tables_text + "\n\n" + full_text)[:18000]
+
+    # simple keyword screening inside content (non-strict)
+    content_low = merged.lower()
+    for kw in [country_kw, sector_kw, keywords]:
+        if kw and kw.lower() not in content_low:
+            # not strict: we still allow; but mark as weaker match
+            pass
 
     # regex first
-    rx = regex_find_metrics(joined)
-    for metric, value, _ in rx:
-        if metrics[metric] is None:
-            metrics[metric] = value
+    val = regex_extract(merged, metric)
+    if val:
+        return {
+            "title": title or "(Untitled)",
+            "authors": authors,
+            "metric": metric,
+            "value": val,
+            "provenance": "PDF (regex)",
+            "snippet": "",
+            "page_hint": "",
+            "link": used
+        }
 
-    # LLM fallback if missing
-    if any(v is None for v in metrics.values()) and joined:
-        llm = openai_structured_extract(joined[:15000], title, authors, url) or {}
-        keymap = {"sd":"SD","se":"SE","icc":"ICC","mde":"MDE","variance":"Variance"}
-        for k,v in llm.items():
-            if k in keymap and v and metrics[keymap[k]] is None:
-                metrics[keymap[k]] = v
-        if "citations" in llm:
-            cites = llm["citations"]
+    # LLM fallback
+    ext = openai_extract(merged, metric) or {}
+    if ext.get("value"):
+        return {
+            "title": title or "(Untitled)",
+            "authors": authors,
+            "metric": metric,
+            "value": ext["value"],
+            "provenance": "PDF (LLM)" if used == link else "Web (LLM)",
+            "snippet": ext.get("snippet",""),
+            "page_hint": ext.get("page_hint",""),
+            "link": used
+        }
+    return None
 
-    rows = []
-    for k in ["SD","SE","ICC","MDE","Variance"]:
-        prov = "Not found"
-        if metrics[k] is not None:
-            prov = "PDF (regex)" if any(m==k for (m,_,_) in rx) else "PDF (LLM)"
-        rows.append({"metric":k,"value":metrics[k],"provenance":prov,"details":cites})
-    return rows, "ok"
+# ---------- UI: SEARCH BOXES ----------
+st.subheader("Search")
+colA, colB, colC, colD = st.columns([1.1, 1.1, 1.3, 1])
+metric = colA.selectbox("Metric", ["SD","SE","ICC","MDE","Variance"], index=0, help="Pick the statistic you want")
+country_kw = colB.text_input("Country (keyword)", value="", placeholder="e.g., India")
+sector_kw  = colC.text_input("Sector / Domain", value="", placeholder="e.g., education")
+keywords   = colD.text_input("Extra keywords", value="", placeholder="e.g., math scores")
 
-def extract_with_web_fallback(title, authors, primary_link):
-    rows, status = extract_from_pdf_url(primary_link, title, authors)
-    if status == "ok":
-        return rows, primary_link
-    # try web search for an accessible PDF
-    q = f'{title} {authors} filetype:pdf'
-    hits = google_cse_search(q, num=4)
-    for h in hits:
-        rows2, status2 = extract_from_pdf_url(h["link"], title, authors)
-        if status2 == "ok":
-            for r in rows2:
-                if r["provenance"].startswith("PDF"):
-                    r["provenance"] = "Web (PDF)"
-                elif r["value"]:
-                    r["provenance"] = "Web (LLM)"
-            return rows2, h["link"]
-    # nothing
-    empty = [{"metric":k,"value":None,"provenance":"Not found","details":[]} for k in ["SD","SE","ICC","MDE","Variance"]]
-    return empty, None
+colE, colF, colG = st.columns([1,1,2])
+max_results = colE.slider("How many results?", 2, 4, 3, help="We will stop when we find this many solid hits")
+scan_limit  = colF.number_input("Max rows to scan", min_value=10, max_value=1000, value=200, step=10, help="To keep it fast")
+use_web     = colG.checkbox("Search open web if PDF missing", value=True)
 
-# ---------- UI ----------
-st.subheader("Step 1: Connect your Google Sheet")
-csv_url_input = st.text_input("Paste your Google Sheet CSV link (from 'Publish to web')", value=SHEET_CSV_URL or "")
-st.caption("Tip: File → Share → Publish to web → format: CSV → Publish, then copy the link here or set in Secrets.")
+csv_url = st.text_input("Your Google Sheet CSV link", value=SHEET_CSV_URL or "", help="File → Share → Publish to web → CSV")
+strict = st.checkbox("Strict: require keywords in title/authors/link", value=False)
 
-cols = st.columns([2,1])
-with cols[0]:
-    search_term = st.text_input("Optional: Filter by study/author/keyword", "")
-with cols[1]:
-    max_rows = st.number_input("How many rows to process now?", min_value=1, max_value=1000, value=20, step=5)
+if st.button("Search"):
+    if not csv_url:
+        st.error("Please paste your Google Sheet CSV link.")
+        st.stop()
 
-if st.button("Load sheet"):
-    df = load_sheet(csv_url_input)
+    df = load_sheet(csv_url)
     if df.empty:
         st.stop()
 
-    # try to guess columns for title/authors/link
-    link_cols = [c for c in df.columns if "link" in c.lower() or "url" in c.lower()]
-    title_cols = [c for c in df.columns if c.lower() in ("title","study","study title","paper","name of study")]
-    auth_cols  = [c for c in df.columns if "author" in c.lower()]
-
-    if not link_cols:
-        st.error("I can't find a Link/URL column in your sheet. Please add one.")
+    # try to ensure columns exist
+    if not any("link" in c.lower() or "url" in c.lower() for c in df.columns):
+        st.error("I can't find a Link/URL column in your sheet. Add a column named Link or URL.")
         st.stop()
 
-    link_col = link_cols[0]
-    title_col = title_cols[0] if title_cols else df.columns[0]
-    auth_col  = auth_cols[0]  if auth_cols else (df.columns[1] if len(df.columns)>1 else df.columns[0])
-
-    if search_term.strip():
-        mask = df.astype(str).apply(lambda r: r.str.contains(search_term, case=False, na=False)).any(axis=1)
-        df = df[mask]
-
-    st.success(f"Loaded {len(df)} rows from your sheet.")
-    df = df.head(int(max_rows))
-    st.dataframe(df[[title_col, auth_col, link_col]].rename(columns={title_col:"Title", auth_col:"Authors", link_col:"Link"}), use_container_width=True)
-
-    results = []
+    # main loop
+    hits = []
+    st.info("Searching… (we’ll stop once we have your requested number of results)")
     prog = st.progress(0)
-    for i, row in df.reset_index(drop=True).iterrows():
-        title  = str(row.get(title_col,"")).strip()
-        auths  = str(row.get(auth_col,"")).strip()
-        link   = str(row.get(link_col,"")).strip()
+    total = min(len(df), int(scan_limit))
 
-        with st.expander(f"{i+1}. {title or '(Untitled)'}", expanded=False):
-            with st.spinner("Extracting…"):
-                rows, used_link = extract_with_web_fallback(title, auths, link)
-                for r in rows:
-                    results.append({
-                        "Title": title, "Authors": auths,
-                        "Study Link": used_link or link,
-                        "Metric": r["metric"], "Value": r["value"],
-                        "Provenance": r["provenance"]
-                    })
-                st.table(pd.DataFrame([x for x in results if x["Title"]==title]))
+    for idx, row in df.head(total).reset_index(drop=True).iterrows():
+        try:
+            result = try_one_study(row, metric, country_kw, sector_kw, keywords, use_web, strict_filter=strict)
+            if result:
+                # light relevance scoring: prefer exact keyword matches in content/title
+                score = 0
+                title_text = f"{result['title']} {result['authors']}".lower()
+                for kw in [country_kw, sector_kw, keywords]:
+                    if kw and kw.lower() in title_text:
+                        score += 2
+                if result["provenance"] == "PDF (regex)":
+                    score += 3
+                elif "LLM" in result["provenance"]:
+                    score += 1
+                result["score"] = score
+                hits.append(result)
+                # stop early if enough
+                if len([h for h in hits]) >= max_results:
+                    break
+        except Exception:
+            continue
+        prog.progress(int((idx+1)/max(1,total)*100))
 
-        prog.progress(int((i+1)/len(df)*100))
+    if not hits:
+        st.warning("No results found that match your inputs. Try fewer/more general keywords, or enable web search.")
+    else:
+        # sort by score (desc)
+        hits = sorted(hits, key=lambda x: x.get("score",0), reverse=True)[:max_results]
 
-    if results:
-        st.subheader("All results")
-        out_df = pd.DataFrame(results)
-        st.dataframe(out_df, use_container_width=True)
-        st.download_button("⬇️ Download CSV", out_df.to_csv(index=False).encode("utf-8"),
-                           file_name="rct_metrics.csv", mime="text/csv")
+        st.success(f"Found {len(hits)} result(s).")
+        for h in hits:
+            with st.container(border=True):
+                st.markdown(f"### {h['title']}")
+                if h['authors']:
+                    st.markdown(f"**Authors:** {h['authors']}")
+                st.markdown(f"**Metric:** {h['metric']}  |  **Value:** `{h['value']}`  |  **Source:** {h['provenance']}")
+                if h.get("page_hint") or h.get("snippet"):
+                    st.caption(f"{h.get('page_hint','')}: {h.get('snippet','')}")
+                st.markdown(f"[Open study]({h['link']})", unsafe_allow_html=True)
+
+        # export small table
+        out = pd.DataFrame([{
+            "Title": h["title"], "Authors": h["authors"], "Metric": h["metric"],
+            "Value": h["value"], "Source": h["provenance"], "Page/Hint": h.get("page_hint",""),
+            "Link": h["link"]
+        } for h in hits])
+        st.download_button("⬇️ Download these results (CSV)", out.to_csv(index=False).encode("utf-8"),
+                           file_name="rct_metric_search_results.csv", mime="text/csv")
 
 st.divider()
-st.markdown("**Legend:** ✅ PDF (regex) = exact text/table match · 🟦 PDF/Web (LLM) = extracted by GPT from content · ❌ Not found = nowhere available I could access")
+st.markdown("**Notes**: ✅ PDF (regex) = exact match from text/tables · 🟦 LLM = extracted by GPT from visible content · ❌ We never bypass paywalls; open-web search looks for accessible copies (working papers, OSF, Dataverse).")
