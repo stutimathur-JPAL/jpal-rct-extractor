@@ -1,0 +1,7 @@
+streamlit
+pandas
+requests
+pymupdf
+pdfplumber
+lxml
+beautifulsoup4 
