@@ -4,4 +4,4 @@ requests
 pymupdf
 pdfplumber
 lxml
-beautifulsoup4 
+beautifulsoup4
